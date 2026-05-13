@@ -141,14 +141,9 @@ class Purchase(models.Model):
     total_value = models.DecimalField(max_digits=10, decimal_places=2)
 
     def save(self, *args, **kwargs):
-        """
-        Calculates the total value before saving the Purchase instance.
-        """
+        # Stock update lives in CreatePurchaseService (atomic + select_for_update).
         self.total_value = self.price * self.quantity
         super().save(*args, **kwargs)
-        # Update the item quantity
-        self.item.quantity += self.quantity
-        self.item.save()
 
     def __str__(self):
         """
