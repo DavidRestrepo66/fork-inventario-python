@@ -18,6 +18,11 @@
    - 4.4 [domain.py — NUEVO](#44-domainpy--nuevo)
    - 4.5 [repositories.py — NUEVO](#45-repositoriespy--nuevo)
    - 4.6 [services.py — NUEVO](#46-servicespy--nuevo)
+10. [Diagrama de clases completo](#10-diagrama-de-clases-completo)
+11. [Diagramas de flujo por caso de uso](#11-diagramas-de-flujo-por-caso-de-uso)
+    - 11.1 [Flujo: Crear Venta (SaleCreateView)](#111-flujo-crear-venta-salecreateview)
+    - 11.2 [Flujo: Crear Compra (PurchaseCreateView)](#112-flujo-crear-compra-purchasecreateview)
+    - 11.3 [Flujo: Manejo de errores y auditoría](#113-flujo-manejo-de-errores-y-auditoría)
    - 4.7 [audit.py — NUEVO](#47-auditpy--nuevo)
    - 4.8 [tests/ — Nuevo paquete de pruebas](#48-tests--nuevo-paquete-de-pruebas)
    - 4.9 [signals.py — ELIMINADO](#49-signalspy--eliminado)
@@ -962,5 +967,498 @@ Los siguientes puntos no fueron abordados en esta re-arquitectura y representan 
 4. **`PurchaseCreateView` en `views.py`**: fue refactorizado para usar `CreatePurchaseService` pero heredó parcialmente del formulario Django (`form_valid`). Podría unificarse al patrón JSON/service del resto.
 
 5. **Tests de integración**: `test_services.py` usa mocks. Falta un test que golpee la base de datos real para verificar que `select_for_update()` funciona bajo concurrencia simulada.
+
+6. **`store.models.Item` tiene `price` como `FloatField`**: el repositorio ya compensa con `Decimal(str(item.price))`, pero la fuente de verdad sigue siendo imprecisa. Migrar a `DecimalField` eliminaría la conversión.
+
+---
+
+## 10. Diagrama de clases completo
+
+El diagrama cubre los 6 módulos re-arquitecturados. Se omiten las clases Django base (`Model`, `ListView`, etc.) para mantener la legibilidad.
+
+```mermaid
+classDiagram
+    %% ─────────────────────────────────────────
+    %% DOMAIN (domain.py)
+    %% ─────────────────────────────────────────
+    class Money {
+        +Decimal amount
+        +str currency = "USD"
+        +__post_init__()
+        +__add__(other: Money) Money
+        +__mul__(scalar) Money
+    }
+
+    class PriceSnapshot {
+        +Decimal amount
+        +datetime captured_at
+        +int item_id
+        +to_money() Money
+    }
+
+    class SaleLineItem {
+        +int item_id
+        +int quantity
+        +PriceSnapshot price_snapshot
+        +__post_init__()
+        +total() Money
+        +to_dict() dict
+    }
+
+    class SaleAggregate {
+        +int|None id
+        +int customer_id
+        +list~SaleLineItem~ line_items
+        +Decimal tax_percentage
+        +Decimal amount_paid
+        +str notes
+        +__post_init__()
+        +subtotal() Money
+        +tax_amount() Money
+        +grand_total() Money
+        +amount_change() Money
+        +to_dict() dict
+    }
+
+    SaleLineItem --> PriceSnapshot : contiene
+    SaleLineItem --> Money : calcula total
+    SaleAggregate --> SaleLineItem : 1..*
+    SaleAggregate --> Money : calcula totales
+    PriceSnapshot --> Money : to_money()
+
+    %% ─────────────────────────────────────────
+    %% EXCEPTIONS (exceptions.py)
+    %% ─────────────────────────────────────────
+    class TransactionError {
+        <<exception>>
+    }
+
+    class InsufficientStockError {
+        <<exception>>
+        +int item_id
+        +int requested
+        +int available
+        +__init__(item_id, requested, available)
+    }
+
+    class ItemNotFoundError {
+        <<exception>>
+        +int item_id
+        +__init__(item_id)
+    }
+
+    class InvalidSaleError {
+        <<exception>>
+    }
+
+    class InvalidPurchaseError {
+        <<exception>>
+    }
+
+    class UnauthorizedOperationError {
+        <<exception>>
+    }
+
+    TransactionError <|-- InsufficientStockError
+    TransactionError <|-- ItemNotFoundError
+    TransactionError <|-- InvalidSaleError
+    TransactionError <|-- InvalidPurchaseError
+    TransactionError <|-- UnauthorizedOperationError
+
+    %% ─────────────────────────────────────────
+    %% REPOSITORIES (repositories.py)
+    %% ─────────────────────────────────────────
+    class InventoryRepository {
+        +get_available_stock(item_id: int) int
+        +get_item_price(item_id: int) Money
+        +check_stock_availability(items_needed: dict) None
+        +reduce_stock(item_id: int, quantity: int) None
+        +reduce_stock_batch(reductions: dict) None
+        +increase_stock(item_id: int, quantity: int) None
+    }
+
+    class SaleRepository {
+        +create_from_aggregate(aggregate: SaleAggregate) Sale
+        +get_by_id(sale_id: int) Sale
+    }
+
+    class PurchaseRepository {
+        +create(item_id, vendor_id, quantity, price, description, delivery_date, delivery_status) Purchase
+    }
+
+    InventoryRepository ..> Money : retorna
+    InventoryRepository ..> InsufficientStockError : lanza
+    InventoryRepository ..> ItemNotFoundError : lanza
+    SaleRepository ..> SaleAggregate : consume
+    SaleRepository ..> TransactionError : lanza
+
+    %% ─────────────────────────────────────────
+    %% SERVICES (services.py)
+    %% ─────────────────────────────────────────
+    class CreateSaleService {
+        -InventoryRepository inventory
+        -SaleRepository sales
+        -AuditLogger audit
+        +__init__(inventory_repo, sale_repo, audit_logger)
+        +execute(customer_id, items, tax_percentage, amount_paid, user_id) Sale
+        -_validate_input_shape(items: list) None
+        -_build_line_items(items: list) list~SaleLineItem~
+    }
+
+    class CreatePurchaseService {
+        -InventoryRepository inventory
+        -PurchaseRepository purchases
+        -AuditLogger audit
+        +__init__(inventory_repo, purchase_repo, audit_logger)
+        +execute(item_id, vendor_id, quantity, price, description, delivery_date, delivery_status, user_id) Purchase
+        -_validate(quantity, price) None
+    }
+
+    CreateSaleService --> InventoryRepository : usa
+    CreateSaleService --> SaleRepository : usa
+    CreateSaleService --> AuditLogger : usa
+    CreateSaleService ..> SaleAggregate : construye
+    CreateSaleService ..> InvalidSaleError : lanza
+    CreatePurchaseService --> InventoryRepository : usa
+    CreatePurchaseService --> PurchaseRepository : usa
+    CreatePurchaseService --> AuditLogger : usa
+    CreatePurchaseService ..> InvalidPurchaseError : lanza
+
+    %% ─────────────────────────────────────────
+    %% AUDIT (audit.py)
+    %% ─────────────────────────────────────────
+    class AuditLogger {
+        +log_sale_created(sale_id, customer_id, total, user_id) None
+        +log_sale_failed(customer_id, reason, user_id) None
+        +log_purchase_created(purchase_id, item_id, vendor_id, quantity, total_value, user_id) None
+        +log_purchase_failed(item_id, vendor_id, reason, user_id) None
+    }
+
+    %% ─────────────────────────────────────────
+    %% MODELS (models.py) — solo lo re-arquitecturado
+    %% ─────────────────────────────────────────
+    class Sale {
+        +DateTimeField date_added
+        +ForeignKey customer
+        +DecimalField sub_total
+        +DecimalField grand_total
+        +DecimalField tax_amount
+        +FloatField tax_percentage
+        +DecimalField amount_paid
+        +DecimalField amount_change
+        +sum_products() int
+    }
+
+    class SaleDetail {
+        +ForeignKey sale
+        +ForeignKey item
+        +DecimalField price
+        +PositiveIntegerField quantity
+        +DecimalField total_detail
+    }
+
+    class Purchase {
+        +AutoSlugField slug
+        +ForeignKey item
+        +ForeignKey vendor
+        +TextField description
+        +DateTimeField order_date
+        +DateTimeField delivery_date
+        +PositiveIntegerField quantity
+        +CharField delivery_status
+        +DecimalField price
+        +DecimalField total_value
+        +save()
+    }
+
+    Sale "1" --> "0..*" SaleDetail : tiene
+    SaleRepository ..> Sale : persiste
+    SaleRepository ..> SaleDetail : persiste
+    PurchaseRepository ..> Purchase : persiste
+
+    %% ─────────────────────────────────────────
+    %% VIEWS (views.py) — solo las afectadas
+    %% ─────────────────────────────────────────
+    class SaleCreateView {
+        <<function>>
+        +request: HttpRequest
+        +retorna: JsonResponse
+    }
+
+    class PurchaseCreateView {
+        <<CBV>>
+        +model = Purchase
+        +form_class = PurchaseForm
+        +get_success_url() str
+        +form_valid(form) HttpResponse
+    }
+
+    SaleCreateView --> CreateSaleService : delega
+    SaleCreateView --> InventoryRepository : instancia
+    SaleCreateView --> SaleRepository : instancia
+    SaleCreateView --> AuditLogger : instancia
+    SaleCreateView ..> InsufficientStockError : captura
+    SaleCreateView ..> TransactionError : captura
+    PurchaseCreateView --> CreatePurchaseService : delega
+    PurchaseCreateView --> InventoryRepository : instancia
+    PurchaseCreateView --> PurchaseRepository : instancia
+    PurchaseCreateView --> AuditLogger : instancia
+```
+
+---
+
+## 11. Diagramas de flujo por caso de uso
+
+### 11.1 Flujo: Crear Venta (`SaleCreateView`)
+
+Cubre el camino completo desde el POST HTTP hasta la persistencia en base de datos, incluyendo todos los puntos de fallo y auditoría.
+
+```mermaid
+flowchart TD
+    START([Browser POST /transactions/sales/\nContent-Type: application/json])
+
+    subgraph VIEW["views.py — SaleCreateView"]
+        V1{¿Es POST\ny AJAX?}
+        V2[Parsear JSON\njson.loads request.body]
+        V3{¿JSON\nválido?}
+        V4[Extraer campos:\ncustomer_id, tax_percentage\namount_paid, items]
+        V5{¿Tipos\nválidos?}
+        V6[Instanciar\nCreateSaleService]
+        V_ERR1[JsonResponse 400\n'Invalid JSON']
+        V_ERR2[JsonResponse 400\n'Invalid request data']
+        V_ERR3[JsonResponse 400\nInsufficientStockError\n+ item_id, requested, available]
+        V_ERR4[JsonResponse 400\nTransactionError message]
+        V_ERR5[JsonResponse 500\n'Unexpected error'\n+ logger.exception]
+        V_OK[JsonResponse 200\nsale_id + redirect]
+    end
+
+    subgraph SERVICE["services.py — CreateSaleService.execute()"]
+        S1[_validate_input_shape\n¿tiene item_id y qty?]
+        S2{¿Items\nválidos?}
+        S3[transaction.atomic INICIO]
+        S4[_build_line_items\nconsultar precios actuales]
+        S5[Construir SaleAggregate\ncustomer_id, line_items\ntax_percentage, amount_paid]
+        S6{¿Aggregate\nválido?}
+        S7[check_stock_availability\npara todos los items]
+        S8{¿Stock\nsuficiente?}
+        S9[create_from_aggregate\npersistir Sale + SaleDetails]
+        S10[reduce_stock_batch\nreducir stock con lock]
+        S11[log_sale_created\naudit OK]
+        S12[transaction.atomic FIN\nCOMMIT]
+        S_ERR1[log_sale_failed\naudit FAIL]
+        S_ERR2[log_sale_failed\naudit FAIL]
+        S_ERR3[log_sale_failed\naudit FAIL]
+    end
+
+    subgraph REPO["repositories.py — InventoryRepository + SaleRepository"]
+        R1[get_item_price\nItem.objects.get id\nDecimal str item.price]
+        R2[check_stock_availability\ncomparar qty vs stock]
+        R3[Sale.objects.create\nSaleDetail.objects.create\npor cada line_item]
+        R4[reduce_stock — por cada item\nItem.objects\n.select_for_update\n.get id\nitem.quantity -= qty\nitem.save update_fields=quantity]
+        R_ERR1{{ItemNotFoundError}}
+        R_ERR2{{InsufficientStockError}}
+        R_ERR3{{TransactionError\nCustomer not found}}
+    end
+
+    subgraph DOMAIN["domain.py — SaleAggregate.__post_init__"]
+        D1{¿line_items\nno vacío?}
+        D2{¿0 ≤ tax ≤ 100?}
+        D3{¿customer_id\npresente?}
+        D4{¿amount_paid\n≥ grand_total?}
+        D5[Calcular subtotal\ntax_amount, grand_total\namount_change]
+    end
+
+    START --> V1
+    V1 -- No --> RENDER([render sale_create.html])
+    V1 -- Sí --> V2
+    V2 --> V3
+    V3 -- No --> V_ERR1
+    V3 -- Sí --> V4
+    V4 --> V5
+    V5 -- No --> V_ERR2
+    V5 -- Sí --> V6
+    V6 --> S1
+    S1 --> S2
+    S2 -- No --> S_ERR1 --> V_ERR2
+    S2 -- Sí --> S3
+    S3 --> S4
+    S4 --> R1
+    R1 -- item existe --> S5
+    R1 -- item no existe --> R_ERR1 --> S_ERR2 --> V_ERR4
+    S5 --> D1
+    D1 -- No --> S_ERR2 --> V_ERR2
+    D1 -- Sí --> D2
+    D2 -- No --> S_ERR2 --> V_ERR2
+    D2 -- Sí --> D3
+    D3 -- No --> S_ERR2 --> V_ERR2
+    D3 -- Sí --> D4
+    D4 -- No → underpayment --> S_ERR2 --> V_ERR2
+    D4 -- Sí --> D5
+    D5 --> S7
+    S7 --> R2
+    R2 -- stock OK --> S9
+    R2 -- stock insuficiente --> R_ERR2 --> S_ERR3 --> V_ERR3
+    S9 --> R3
+    R3 -- Customer existe --> S10
+    R3 -- Customer no existe --> R_ERR3 --> S_ERR3 --> V_ERR4
+    S10 --> R4
+    R4 --> S11
+    S11 --> S12
+    S12 --> V_OK
+    V_OK --> END([Browser recibe sale_id\ny redirige a /sales/])
+
+    S3 -. rollback si cualquier\nstep falla .-> ROLLBACK([DB ROLLBACK\nningún cambio persiste])
+
+    style VIEW fill:#fce4ec,stroke:#880e4f,color:#000
+    style SERVICE fill:#e3f2fd,stroke:#1565c0,color:#000
+    style REPO fill:#fff3e0,stroke:#e65100,color:#000
+    style DOMAIN fill:#e8f5e9,stroke:#2e7d32,color:#000
+```
+
+---
+
+### 11.2 Flujo: Crear Compra (`PurchaseCreateView`)
+
+```mermaid
+flowchart TD
+    START([Browser POST /transactions/purchases/new/\nContent-Type: multipart/form-data])
+
+    subgraph VIEW["views.py — PurchaseCreateView.form_valid()"]
+        V1[Django valida PurchaseForm]
+        V2{¿Form\nválido?}
+        V3[Extraer campos del form:\nitem_id, vendor_id, quantity\nprice, description, delivery_date\ndelivery_status]
+        V4[Instanciar\nCreatePurchaseService]
+        V_ERR1[render form con errores\nHTTP 200]
+        V_ERR2[render form\ncon error message]
+        V_OK[redirect get_success_url\n/transactions/purchases/]
+    end
+
+    subgraph SERVICE["services.py — CreatePurchaseService.execute()"]
+        S1[_validate\nquantity > 0\nprice >= 0]
+        S2{¿Datos\nválidos?}
+        S3[transaction.atomic INICIO]
+        S4[purchases.create\npersistir Purchase]
+        S5[inventory.increase_stock\nincrementar stock del item]
+        S6[log_purchase_created\naudit OK]
+        S7[transaction.atomic FIN\nCOMMIT]
+        S_ERR1[log_purchase_failed\naudit FAIL]
+        S_ERR2[log_purchase_failed\naudit FAIL]
+    end
+
+    subgraph REPO_P["repositories.py — PurchaseRepository.create()"]
+        R1{¿Item\nexiste?}
+        R2{¿Vendor\nexiste?}
+        R3[Purchase.objects.create\nincluye total_value = price × qty]
+        R_ERR1{{ItemNotFoundError}}
+        R_ERR2{{TransactionError\nVendor not found}}
+    end
+
+    subgraph REPO_I["repositories.py — InventoryRepository.increase_stock()"]
+        I1[Item.objects\n.select_for_update\n.get item_id]
+        I2{¿Item\nexiste?}
+        I3[item.quantity += quantity\nitem.save update_fields=quantity]
+        I_ERR1{{ItemNotFoundError}}
+    end
+
+    START --> V1
+    V1 --> V2
+    V2 -- No --> V_ERR1
+    V2 -- Sí --> V3
+    V3 --> V4
+    V4 --> S1
+    S1 --> S2
+    S2 -- No qty≤0 o price<0 --> S_ERR1 --> V_ERR2
+    S2 -- Sí --> S3
+    S3 --> S4
+    S4 --> R1
+    R1 -- No --> R_ERR1 --> S_ERR2 --> V_ERR2
+    R1 -- Sí --> R2
+    R2 -- No --> R_ERR2 --> S_ERR2 --> V_ERR2
+    R2 -- Sí --> R3
+    R3 --> S5
+    S5 --> I1
+    I1 --> I2
+    I2 -- No --> I_ERR1 --> S_ERR2 --> V_ERR2
+    I2 -- Sí --> I3
+    I3 --> S6
+    S6 --> S7
+    S7 --> V_OK
+    V_OK --> END([Browser redirige\na lista de compras])
+
+    S3 -. rollback si\ncualquier step falla .-> ROLLBACK([DB ROLLBACK\nPurchase no creada\nstock no modificado])
+
+    style VIEW fill:#fce4ec,stroke:#880e4f,color:#000
+    style SERVICE fill:#e3f2fd,stroke:#1565c0,color:#000
+    style REPO_P fill:#fff3e0,stroke:#e65100,color:#000
+    style REPO_I fill:#ffe0b2,stroke:#e65100,color:#000
+```
+
+---
+
+### 11.3 Flujo: Manejo de errores y auditoría
+
+Muestra cómo los errores se propagan entre capas y cómo la auditoría se dispara en cada punto de fallo o éxito.
+
+```mermaid
+flowchart LR
+    subgraph ORIGEN["Origen del error"]
+        E1["DB → ItemNotFoundError"]
+        E2["DB → InsufficientStockError\nitem_id, requested, available"]
+        E3["Domain → ValueError\nunderpayment / tax inválido"]
+        E4["DB → TransactionError\nCustomer/Vendor not found"]
+        E5["Runtime → WeirdError\nerror inesperado"]
+        E6["✓ Éxito completo"]
+    end
+
+    subgraph SERVICE_CATCH["services.py — bloques except"]
+        SC1["except ValueError\n→ wrap en InvalidSaleError\n→ audit.log_sale_failed"]
+        SC2["except InsufficientStockError\nItemNotFoundError\nTransactionError\n→ re-lanza SIN modificar\n→ audit.log_sale_failed"]
+        SC3["except Exception\n→ re-lanza SIN enmascarar\n→ audit.log_sale_failed\nreason = 'unexpected: WeirdError: ...'"]
+        SC4["✓ audit.log_sale_created\nsale_id, customer_id\ntotal, user_id, timestamp"]
+    end
+
+    subgraph AUDIT_LOG["audit.py — AuditLogger"]
+        A1["WARNING: SALE_FAILED\ncustomer_id=X\nreason=...\nuser_id=Y\ntimestamp=..."]
+        A2["INFO: SALE_CREATED\nsale_id=X\ncustomer_id=Y\ntotal=Z\nuser_id=W\ntimestamp=..."]
+    end
+
+    subgraph VIEW_CATCH["views.py — bloques except"]
+        VC1["except InsufficientStockError\n→ JsonResponse 400\n+ item_id, requested, available"]
+        VC2["except TransactionError\n→ JsonResponse 400\n+ message"]
+        VC3["except Exception\n→ JsonResponse 500\n+ logger.exception stack trace"]
+        VC4["→ JsonResponse 200\nsale_id + redirect"]
+    end
+
+    E1 --> SC2 --> A1
+    E2 --> SC2 --> A1
+    E3 --> SC1 --> A1
+    E4 --> SC2 --> A1
+    E5 --> SC3 --> A1
+    E6 --> SC4 --> A2
+
+    SC1 --> VC2
+    SC2 --> VC1
+    SC2 --> VC2
+    SC3 --> VC3
+    SC4 --> VC4
+
+    style ORIGEN fill:#ffebee,stroke:#c62828,color:#000
+    style SERVICE_CATCH fill:#e3f2fd,stroke:#1565c0,color:#000
+    style AUDIT_LOG fill:#f3e5f5,stroke:#6a1b9a,color:#000
+    style VIEW_CATCH fill:#fce4ec,stroke:#880e4f,color:#000
+```
+
+**Reglas de propagación**:
+
+| Tipo de error | Service hace | View recibe | HTTP |
+|---|---|---|---|
+| `ValueError` (dominio) | Envuelve en `InvalidSaleError` | `TransactionError` | 400 |
+| `InsufficientStockError` | Re-lanza intacto | `InsufficientStockError` con campos | 400 |
+| `ItemNotFoundError` | Re-lanza intacto | `TransactionError` | 400 |
+| `TransactionError` | Re-lanza intacto | `TransactionError` | 400 |
+| Cualquier `Exception` | Re-lanza intacto | `Exception` genérico | 500 |
+| Éxito | Retorna `Sale` | Objeto `sale` | 200 |
+
+En todos los casos de fallo, **`audit.log_sale_failed` se llama antes de re-lanzar**, garantizando que ningún error queda sin traza de auditoría.
 
 6. **`store.models.Item` tiene `price` como `FloatField`**: el repositorio ya compensa con `Decimal(str(item.price))`, pero la fuente de verdad sigue siendo imprecisa. Migrar a `DecimalField` eliminaría la conversión.
